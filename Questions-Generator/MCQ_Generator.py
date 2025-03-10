@@ -8,45 +8,49 @@ from langchain.schema import HumanMessage
 import ollama
 
 # Initialize the LLM
-LANGUAGE_MODEL = lambda prompt: ollama.generate(model="deepseek-r1:1.5b", prompt=prompt)["response"]
+LANGUAGE_MODEL = lambda prompt: ollama.generate(model="deepseek-coder:6.7b", prompt=prompt)["response"]
 
 # Define prompt template
 PROMPT_TEMPLATE = """
 You are an expert assistant specializing in educational question generation.  
-Your task is to generate exactly 20 multiple-choice questions (MCQs) from the provided document.  
+Your task is to generate **at least 20 multiple-choice questions (MCQs)** from the provided document, focusing on key concepts, definitions, and practical knowledge.  
 
 ### **Strict Guidelines:**  
-- Each question must have exactly four answer choices (A, B, C, D).  
-- One correct answer should be labeled at the end with a numerical degree (1-100).  
-- Do **not** include explanations, reasoning, or any extra text.  
-- The format **must** be followed exactly without any deviation.  
+- Generate questions **directly based on the document content** to ensure accuracy and relevance.  
+- **Do NOT generate questions outside the given context.**  
+- Each question must have exactly **4 distinct answer choices (A, B, C, D)**.  
+- Clearly label the correct answer as **"correct_answer"**.  
+- **Do NOT** include explanations, reasoning, or any extra text.  
+- If unsure, **skip ambiguous or unclear sections** instead of guessing.  
 
-### **Expected Format (Strictly Follow This):**  
-
-**Question 1**  
-question?  
-
-A) option a  
-B) option b  
-C) option c  
-D) option d  
-
-Correct Answer: C) option c (85)
-
-**Question 2**  
-question?  
-
-A) option a  
-B) option b  
-C) option c  
-D) option d  
-
-Correct Answer: B) option b (90)
-
-(Continue this pattern for all 20 MCQs and **don't change any letter or space**.)  
-
-**Context:**  
+Context (Document Content):  
 {context_text}  
+
+### **Expected Output (Valid JSON Format Only):**  
+
+Return the result **strictly as valid JSON**, like this:  
+
+```json
+[
+  {{
+    "question": "Which SQL clause is used to filter rows based on a specified condition?",
+    "options": ["A) ORDER BY", "B) WHERE", "C) GROUP BY", "D) HAVING"],
+    "correct_answer": "B) WHERE"
+  }},
+  {{
+    "question": "What is the purpose of a foreign key in a relational database?",
+    "options": ["A) To enforce unique values in a column", "B) To establish a relationship between tables", "C) To store binary data", "D) To define a table’s primary identifier"],
+    "correct_answer": "B) To establish a relationship between tables"
+  }}
+]
+Additional Requirements:
+Content Coverage: Cover a range of topics (e.g., SQL queries, normalization, indexes, joins, constraints, etc.).
+Difficulty Levels: Mix easy, medium, and hard questions for balanced assessment.
+Validation: Double-check the JSON format for validity and completeness.
+Question Count: Generate a minimum of 20 questions — more are welcome, but not fewer.
+If the content is insufficient for 20 questions, extract multiple questions per key concept or combine related points to meet the quota.
+
+Do not change the structure or format. Return the questions directly as a JSON array, ready for parsing and saving to a file.
 """
 
 def load_pdfs(files):
@@ -84,22 +88,23 @@ def generate_mcqs(context_text):
 
 def extract_mcqs(text):
     """Extracts MCQs into structured format with numerical degrees."""
-    pattern = r'\*\*Question \d+\*\*\s+(.*?)\s+\nA\) (.*?)\s+\nB\) (.*?)\s+\nC\) (.*?)\s+\nD\) (.*?)\s+\n\nCorrect Answer: (A|B|C|D)\) (.*?) \((\d+)\)'
-    mcqs = re.findall(pattern, text, re.DOTALL)
-    structured_mcqs = []
-    for mcq in mcqs:
-        structured_mcqs.append({
-            'question': mcq[0].strip(),
-            'options': {
-                'A': mcq[1].strip(),
-                'B': mcq[2].strip(),
-                'C': mcq[3].strip(),
-                'D': mcq[4].strip(),
-            },
-            'correct_answer': mcq[5].strip(),
-            'degree': int(mcq[7].strip())
-        })
-    return structured_mcqs
+    text = text.strip()
+    matches = re.findall(r'\{\s*"question".*?\}', text, re.DOTALL)
+    
+    questions_dict = {}
+    
+    for idx, match in enumerate(matches, start=1):
+        try:
+            question_data = json.loads(match)
+            questions_dict[idx] = {
+                "question": question_data.get("question", ""),
+                "options": question_data.get("options", []),
+                "correct_answer": question_data.get("correct_answer", "")
+            }
+        except json.JSONDecodeError:
+            continue
+    
+    return questions_dict
 
 # Streamlit UI
 st.title("📚 MCQ Generator")
