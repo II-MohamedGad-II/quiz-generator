@@ -1,98 +1,75 @@
 import streamlit as st
-import pdfplumber
+import io
 import re
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chat_models import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema import HumanMessage
-import ollama
+import json
+from concurrent.futures import ThreadPoolExecutor
+from langchain_community.document_loaders import PDFPlumberLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_ollama.llms import OllamaLLM
 
-# Initialize the LLM
-LANGUAGE_MODEL = lambda prompt: ollama.generate(model="deepseek-coder:6.7b", prompt=prompt)["response"]
+LANGUAGE_MODEL = OllamaLLM(model="deepseek-coder:33b")
 
-# Define prompt template
 PROMPT_TEMPLATE = """
 You are an expert assistant specializing in educational question generation.  
-Your task is to generate **at least 20 multiple-choice questions (MCQs)** from the provided document, focusing on key concepts, definitions, and practical knowledge.  
-
-### **Strict Guidelines:**  
-- Generate questions **directly based on the document content** to ensure accuracy and relevance.  
-- **Do NOT generate questions outside the given context.**  
-- Each question must have exactly **4 distinct answer choices (A, B, C, D)**.  
-- Clearly label the correct answer as **"correct_answer"**.  
-- **Do NOT** include explanations, reasoning, or any extra text.  
-- If unsure, **skip ambiguous or unclear sections** instead of guessing.  
+Generate at least **20 multiple-choice questions (MCQs)** based on the provided content.  
+Strict guidelines:  
+- Questions must come directly from the document content.  
+- Each question must have **4 distinct answer choices (A, B, C, D)**.  
+- Label the correct answer as **"correct_answer"**.  
+- **Return only valid JSON output**.  
 
 Context (Document Content):  
 {context_text}  
 
-### **Expected Output (Valid JSON Format Only):**  
-
-Return the result **strictly as valid JSON**, like this:  
+Expected Output (Valid JSON Format Only):  
 
 ```json
 [
   {{
-    "question": "Which SQL clause is used to filter rows based on a specified condition?",
-    "options": ["A) ORDER BY", "B) WHERE", "C) GROUP BY", "D) HAVING"],
-    "correct_answer": "B) WHERE"
-  }},
-  {{
-    "question": "What is the purpose of a foreign key in a relational database?",
-    "options": ["A) To enforce unique values in a column", "B) To establish a relationship between tables", "C) To store binary data", "D) To define a table’s primary identifier"],
-    "correct_answer": "B) To establish a relationship between tables"
+    "question": "Example question?",
+    "options": ["A) Option 1", "B) Option 2", "C) Option 3", "D) Option 4"],
+    "correct_answer": "B) Option 2" # Ensure this is always provided
   }}
 ]
-Additional Requirements:
-Content Coverage: Cover a range of topics (e.g., SQL queries, normalization, indexes, joins, constraints, etc.).
-Difficulty Levels: Mix easy, medium, and hard questions for balanced assessment.
-Validation: Double-check the JSON format for validity and completeness.
-Question Count: Generate a minimum of 20 questions — more are welcome, but not fewer.
-If the content is insufficient for 20 questions, extract multiple questions per key concept or combine related points to meet the quota.
-
-Do not change the structure or format. Return the questions directly as a JSON array, ready for parsing and saving to a file.
+``` 
 """
 
-def load_pdfs(files):
-    """Extracts text from multiple uploaded PDF files."""
-    text = ""
-    for file in files:
-        with pdfplumber.open(file) as pdf:
-            for page in pdf.pages:
-                text += page.extract_text() or ""
-    return text
 
-def normalize_text(text):
-    """Cleans and normalizes extracted text."""
+def clean_text(text):
+    text = text.replace("\n", " ").replace("\r", " ")
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-def chunk_text(text):
-    """Splits text into smaller chunks for processing."""
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200
-    )
-    return text_splitter.split_text(text)
 
-def generate_mcqs(context_text):
-    """Generates MCQs using the LLM."""
-    prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-    formatted_prompt = prompt.format(context_text=context_text)
-    
-    response = LANGUAGE_MODEL(formatted_prompt)  # Direct function call, no .invoke()
-    
-    return response
+def load_pdf_documents(file_bytes, file_name):
+    try:
+        with io.BytesIO(file_bytes) as file_stream:
+            temp_file_name = f"temp_{file_name.replace(' ', '_')}"
+            with open(temp_file_name, "wb") as f:
+                f.write(file_stream.read())
+            document_loader = PDFPlumberLoader(temp_file_name)
+            return document_loader.load()
+    except Exception as e:
+        st.error(f"Failed to load {file_name}: {e}")
+        return None
 
 
+def filter_pages(raw_documents):
+    return [doc for doc in raw_documents if len(doc.page_content.strip()) > 100]
 
-def extract_mcqs(text):
-    """Extracts MCQs into structured format with numerical degrees."""
+
+def adaptive_split(raw_documents):
+    total_length = sum(len(doc.page_content) for doc in raw_documents)
+    chunk_size = min(2000, max(500, total_length // 20))
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=200, add_start_index=True)
+    return splitter.split_documents(raw_documents)
+
+
+def extract_questions(text):
     text = text.strip()
     matches = re.findall(r'\{\s*"question".*?\}', text, re.DOTALL)
-    
     questions_dict = {}
-    
     for idx, match in enumerate(matches, start=1):
         try:
             question_data = json.loads(match)
@@ -103,42 +80,70 @@ def extract_mcqs(text):
             }
         except json.JSONDecodeError:
             continue
-    
     return questions_dict
 
-# Streamlit UI
-st.title("📚 MCQ Generator")
-st.write("Upload PDF documents and generate multiple-choice questions!")
+
+def generate_questions_from_document(document_chunks):
+    selected_chunks = document_chunks[:5]
+    context_text = clean_text("\n\n".join([doc.page_content for doc in selected_chunks]))
+    conversation_prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+    response_chain = conversation_prompt | LANGUAGE_MODEL
+    return response_chain.invoke({"context_text": context_text})
+
+
+def generate_additional_questions(existing_questions, document_chunks):
+    while len(existing_questions) < 10:
+        response = generate_questions_from_document(document_chunks)
+        new_questions = extract_questions(response)
+        existing_questions.update(new_questions)
+
+
+st.title("📘 PDF to MCQ Generator")
+st.write("Upload one or more PDFs, and generate at least 10 MCQs for each!")
 
 uploaded_files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
+
 if uploaded_files:
-    st.success("PDFs uploaded successfully!")
-    
-    # Extract and process the documents
-    raw_text = load_pdfs(uploaded_files)
-    normalized_text = normalize_text(raw_text)
-    chunks = chunk_text(normalized_text)
-    
-    st.write("✅ Documents processed successfully!")
-    
-    # Generate MCQs
-    st.write("🔍 Generating MCQs...")
-    while True:
-        generated_text = generate_mcqs("\n\n".join(chunks[:5]))  # Use first 5 chunks
-        mcqs = extract_mcqs(generated_text)
-        
-        if len(mcqs) > 13:
-            st.write("Done ✅")
-            break
-        else:
-            st.write("--")
-    
-    st.write("🎯 **Generated MCQs:**")
-    for i, mcq in enumerate(mcqs, start=1):
-        st.write(f"**Question {i}:** {mcq['question']}")
-        st.write(f"A) {mcq['options']['A']}")
-        st.write(f"B) {mcq['options']['B']}")
-        st.write(f"C) {mcq['options']['C']}")
-        st.write(f"D) {mcq['options']['D']}")
-        st.write(f"✅ **Correct Answer:** {mcq['correct_answer']} ({mcq['degree']})")
-        st.write("---")
+    results = {}
+    for uploaded_file in uploaded_files:
+        st.write(f"Processing: {uploaded_file.name}... ⏳")
+
+        try:
+            uploaded_file.seek(0)
+            file_bytes = uploaded_file.read()
+
+            raw_docs = load_pdf_documents(file_bytes, uploaded_file.name)
+            if not raw_docs:
+                continue
+
+            filtered_docs = filter_pages(raw_docs)
+            processed_chunks = adaptive_split(filtered_docs)
+            st.write("Document split into adaptive chunks. Generating questions... 🧠")
+
+            response = generate_questions_from_document(processed_chunks)
+            questions = extract_questions(response)
+
+            if len(questions) < 10:
+                st.warning(f"⚠️ Only {len(questions)} questions generated. Generating more to reach 10...")
+                generate_additional_questions(questions, processed_chunks)
+
+            results[uploaded_file.name] = questions
+            st.success(f"✅ {len(questions)} questions generated for {uploaded_file.name}")
+
+        except Exception as e:
+            st.error(f"❌ Error processing {uploaded_file.name}: {e}")
+
+    if results:
+        st.json(results)
+        st.download_button(
+            label="📥 Download Questions as JSON",
+            data=json.dumps(results, indent=2),
+            file_name="mcq_questions.json",
+            mime="application/json"
+        )
+
+st.write("Upload more PDFs or refine your content for fresh questions! 🚀")
+
+if __name__ == '__main__':
+    st.write("Ready to generate educational content with AI? 🚀")
+
