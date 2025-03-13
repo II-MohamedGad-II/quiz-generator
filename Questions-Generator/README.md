@@ -83,5 +83,3 @@ Upload your learning materials (PDF format) and let the system generate customiz
 ## 🤝 Contributing
 
 Feel free to fork the repository, submit issues, or make pull requests. Let’s build an even smarter quiz generation tool together!
-
----
