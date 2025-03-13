@@ -75,6 +75,3 @@ Your file can be found in the following path within the repository:
 ## 🤝 Contributing
 Feel free to fork the repository, submit issues, or make pull requests. Let’s refine the report generator together!
 
----
-Let me know if you’d like any adjustments! 🚀
-
